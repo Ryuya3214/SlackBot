@@ -1,7 +1,7 @@
 """
 Salesforce Services ステータス監視 → Slack ワークフロー Webhook 通知スクリプト
 
-監視対象: countryCode == "JP" かつ isActive == True のインスタンス
+監視対象: TARGET_INSTANCES に列挙したインスタンスのみ
 通知条件: 前回実行時からステータスが変化したとき、または新規インシデント発生時
 通知方法: Slack ワークフロービルダーの Webhook URL に POST
 """
@@ -16,6 +16,12 @@ import requests
 SALESFORCE_API_URL = "https://api.status.salesforce.com/v1/products/Salesforce_Services"
 SLACK_WEBHOOK_URL = os.environ.get("SLACK_WEBHOOK_URL", "")
 STATE_FILE = Path("state.json")
+
+# 監視対象インスタンス: キー → 表示名
+TARGET_INSTANCES = {
+    "JPN156": "本番環境",
+    "JPN6S": "Systest環境",
+}
 
 STATUS_LABEL = {
     "OK": "✅ 正常",
@@ -32,16 +38,17 @@ def fetch_status() -> dict:
     return resp.json()
 
 
-def extract_jp_instances(data: dict) -> dict[str, dict]:
-    """日本（countryCode == 'JP'）のアクティブなインスタンスのみ抽出する。"""
+def extract_target_instances(data: dict) -> dict[str, dict]:
+    """TARGET_INSTANCES に指定したインスタンスのみ抽出する。"""
     result = {}
     for instance in data.get("Instances", []):
-        if instance.get("countryCode") == "JP" and instance.get("isActive"):
-            key = instance["key"]
+        key = instance["key"]
+        if key in TARGET_INSTANCES:
             result[key] = {
                 "status": instance.get("status", "UNKNOWN"),
                 "city": instance.get("city", ""),
                 "environment": instance.get("environment", ""),
+                "env_label": TARGET_INSTANCES[key],
                 "incident_ids": sorted(
                     inc["id"] for inc in instance.get("Incidents", []) if "id" in inc
                 ),
@@ -69,22 +76,19 @@ def build_changes(prev: dict, curr: dict) -> list[dict]:
         prev_info = prev.get(key)
         curr_info = curr.get(key)
 
+        env_label = TARGET_INSTANCES.get(key, key)
+        info = curr_info or prev_info
+        city = info["city"]
+
         if prev_info is None:
-            changes.append({
-                "key": key,
-                "type": "new",
-                "city": curr_info["city"],
-                "environment": curr_info["environment"],
-                "prev_status": None,
-                "curr_status": curr_info["status"],
-                "new_incidents": curr_info["incident_ids"],
-            })
+            # 初回検出はスキップ（初回起動時の全件通知を抑制）
+            pass
         elif curr_info is None:
             changes.append({
                 "key": key,
                 "type": "removed",
-                "city": prev_info["city"],
-                "environment": prev_info["environment"],
+                "city": city,
+                "env_label": env_label,
                 "prev_status": prev_info["status"],
                 "curr_status": None,
                 "new_incidents": [],
@@ -99,8 +103,8 @@ def build_changes(prev: dict, curr: dict) -> list[dict]:
                 changes.append({
                     "key": key,
                     "type": "changed",
-                    "city": curr_info["city"],
-                    "environment": curr_info["environment"],
+                    "city": city,
+                    "env_label": env_label,
                     "prev_status": prev_info["status"],
                     "curr_status": curr_info["status"],
                     "new_incidents": new_incidents,
@@ -110,21 +114,19 @@ def build_changes(prev: dict, curr: dict) -> list[dict]:
 
 def format_message(changes: list[dict]) -> str:
     """変化一覧をテキストメッセージに変換する。"""
-    lines = ["*Salesforce Japan インスタンス ステータス変化*"]
+    lines = ["*Salesforce ステータス変化通知*"]
 
     for ch in changes:
         key = ch["key"]
         city = ch["city"] or "—"
-        env_label = "本番" if ch["environment"] == "production" else "サンドボックス"
+        env_label = ch["env_label"]
         curr_label = STATUS_LABEL.get(ch["curr_status"], ch["curr_status"] or "—")
         prev_label = STATUS_LABEL.get(ch["prev_status"], ch["prev_status"] or "—")
 
-        if ch["type"] == "new":
-            lines.append(f"[新規] {key} ({city} / {env_label}) → {curr_label}")
+        if ch["type"] == "changed":
+            lines.append(f"[{env_label}] {key} ({city}): {prev_label} → {curr_label}")
         elif ch["type"] == "removed":
-            lines.append(f"[削除] {key} ({city} / {env_label}) → 非アクティブ")
-        else:
-            lines.append(f"[変化] {key} ({city} / {env_label}): {prev_label} → {curr_label}")
+            lines.append(f"[{env_label}] {key} ({city}) → 非アクティブ")
 
         for iid in ch["new_incidents"]:
             lines.append(f"  インシデント: https://status.salesforce.com/instances/{key}")
@@ -151,8 +153,8 @@ def main() -> None:
     print("Salesforce Status API を取得中…")
     data = fetch_status()
 
-    curr_state = extract_jp_instances(data)
-    print(f"監視対象 JP インスタンス数: {len(curr_state)}")
+    curr_state = extract_target_instances(data)
+    print(f"監視対象インスタンス数: {len(curr_state)} ({', '.join(curr_state.keys())})")
 
     prev_state = load_previous_state()
     changes = build_changes(prev_state, curr_state)
