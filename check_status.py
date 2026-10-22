@@ -1,8 +1,10 @@
 """
 Salesforce Services ステータス監視 → Slack ワークフロー Webhook 通知スクリプト
 
-監視対象: TARGET_INSTANCES に列挙したインスタンスのサービスごとのインシデント
-通知条件: 新規インシデント発生・既存インシデント復旧（Resolved）
+監視対象:
+  - TARGET_INSTANCES に列挙したインスタンスのサービスごとのインシデント
+  - Salesforce グローバル一般通知（GeneralMessages / Security Advisory など）
+通知条件: 新規インシデント発生・既存インシデント復旧、新規一般通知公開・クローズ
 通知方法: Slack ワークフロービルダーの Webhook URL に POST
 """
 
@@ -87,6 +89,18 @@ def extract_active_incidents(data: dict) -> dict[int, dict]:
     return result
 
 
+def extract_active_general_messages(data: dict) -> dict[int, dict]:
+    """アクティブな GeneralMessages を id をキーとして返す。"""
+    result = {}
+    for msg in data.get("GeneralMessages", []):
+        if msg.get("status") != "Resolved" and msg.get("isVisible", True):
+            result[msg["id"]] = {
+                "subject": msg.get("subject", ""),
+                "status": msg.get("status", ""),
+            }
+    return result
+
+
 def load_previous_state() -> dict:
     if STATE_FILE.exists():
         try:
@@ -103,44 +117,68 @@ def save_current_state(state: dict) -> None:
 def build_changes(prev_state: dict, curr_state: dict) -> list[dict]:
     """
     curr_state / prev_state の構造:
-      { "JPN156": { incident_id(int): {...}, ... }, "JPN6S": {...} }
+      {
+        "JPN156": { incident_id(int): {...}, ... },
+        "JPN6S": {...},
+        "general_messages": { msg_id(int): {...}, ... }
+      }
     """
     changes = []
 
+    # インシデント差分
     for instance_key, env_label in TARGET_INSTANCES.items():
-        prev_incidents = prev_state.get(instance_key, {})
+        prev_incidents = {int(k): v for k, v in prev_state.get(instance_key, {}).items()}
         curr_incidents = curr_state.get(instance_key, {})
 
-        # prev のキーは JSON のため文字列になっている可能性があるので int に統一
-        prev_incidents = {int(k): v for k, v in prev_incidents.items()}
-
-        # 新規インシデント（前回になかったもの）
         for inc_id, inc_info in curr_incidents.items():
             if inc_id not in prev_incidents:
                 changes.append({
                     "change_type": "new",
+                    "kind": "incident",
                     "instance_key": instance_key,
                     "env_label": env_label,
-                    "incident_id": inc_id,
                     "incident_status": inc_info["status"],
                     "incident_type": inc_info["type"],
                     "service_keys": inc_info["service_keys"],
                     "is_core": inc_info["is_core"],
                 })
 
-        # 復旧インシデント（前回あったが今回なくなったもの）
         for inc_id, inc_info in prev_incidents.items():
             if inc_id not in curr_incidents:
                 changes.append({
                     "change_type": "resolved",
+                    "kind": "incident",
                     "instance_key": instance_key,
                     "env_label": env_label,
-                    "incident_id": inc_id,
                     "incident_status": "Resolved",
                     "incident_type": inc_info["type"],
                     "service_keys": inc_info["service_keys"],
                     "is_core": inc_info["is_core"],
                 })
+
+    # GeneralMessages 差分
+    prev_gm = {int(k): v for k, v in prev_state.get("general_messages", {}).items()}
+    curr_gm = curr_state.get("general_messages", {})
+
+    for msg_id, msg_info in curr_gm.items():
+        if msg_id not in prev_gm:
+            changes.append({
+                "change_type": "new",
+                "kind": "general_message",
+                "subject": msg_info["subject"],
+                "msg_status": msg_info["status"],
+                "msg_id": msg_id,
+            })
+
+    for msg_id, msg_info in prev_gm.items():
+        if msg_id not in curr_gm:
+            changes.append({
+                "change_type": "resolved",
+                "kind": "general_message",
+                "subject": msg_info["subject"],
+                "msg_status": "Resolved",
+                "msg_id": msg_id,
+            })
 
     return changes
 
@@ -154,26 +192,45 @@ def format_message(changes: list[dict]) -> str:
     lines = ["*Salesforce ステータス変化通知*"]
 
     for ch in changes:
-        env_label = ch["env_label"]
-        instance_key = ch["instance_key"]
-        services = format_service_names(ch["service_keys"])
-        inc_type = INCIDENT_TYPE_LABEL.get(ch["incident_type"], ch["incident_type"])
-        status_label = INCIDENT_STATUS_LABEL.get(ch["incident_status"], ch["incident_status"])
-        core_mark = "【コア】" if ch["is_core"] else ""
-        url = f"https://status.salesforce.com/instances/{instance_key}"
+        if ch["kind"] == "incident":
+            env_label = ch["env_label"]
+            instance_key = ch["instance_key"]
+            services = format_service_names(ch["service_keys"])
+            inc_type = INCIDENT_TYPE_LABEL.get(ch["incident_type"], ch["incident_type"])
+            status_label = INCIDENT_STATUS_LABEL.get(ch["incident_status"], ch["incident_status"])
+            core_mark = "【コア】" if ch["is_core"] else ""
+            url = f"https://status.salesforce.com/instances/{instance_key}"
 
-        if ch["change_type"] == "new":
-            lines.append(
-                f"{status_label} [{env_label}] {core_mark}{inc_type}発生\n"
-                f"  対象サービス: {services}\n"
-                f"  詳細: {url}"
-            )
-        elif ch["change_type"] == "resolved":
-            lines.append(
-                f"{status_label} [{env_label}] {core_mark}{inc_type}復旧\n"
-                f"  対象サービス: {services}\n"
-                f"  詳細: {url}"
-            )
+            if ch["change_type"] == "new":
+                lines.append(
+                    f"{status_label} [{env_label}] {core_mark}{inc_type}発生\n"
+                    f"  対象サービス: {services}\n"
+                    f"  詳細: {url}"
+                )
+            elif ch["change_type"] == "resolved":
+                lines.append(
+                    f"{status_label} [{env_label}] {core_mark}{inc_type}復旧\n"
+                    f"  対象サービス: {services}\n"
+                    f"  詳細: {url}"
+                )
+
+        elif ch["kind"] == "general_message":
+            subject = ch["subject"]
+            msg_id = ch["msg_id"]
+            url = f"https://status.salesforce.com/generalmessages/{msg_id}"
+
+            if ch["change_type"] == "new":
+                lines.append(
+                    f"ℹ️ *一般通知（新規）*\n"
+                    f"  {subject}\n"
+                    f"  詳細: {url}"
+                )
+            elif ch["change_type"] == "resolved":
+                lines.append(
+                    f"✅ *一般通知（クローズ）*\n"
+                    f"  {subject}\n"
+                    f"  詳細: {url}"
+                )
 
     return "\n".join(lines)
 
@@ -196,11 +253,19 @@ def main() -> None:
     print("Salesforce インスタンスステータスを取得中…")
 
     curr_state = {}
+    first_data = None
     for instance_key, env_label in TARGET_INSTANCES.items():
         data = fetch_instance_status(instance_key)
         active = extract_active_incidents(data)
         curr_state[instance_key] = active
         print(f"  {instance_key} ({env_label}): アクティブインシデント {len(active)} 件")
+        if first_data is None:
+            first_data = data
+
+    # GeneralMessages は JPN156 から1回だけ取得（全インスタンス共通）
+    active_gm = extract_active_general_messages(first_data)
+    curr_state["general_messages"] = active_gm
+    print(f"  一般通知（GeneralMessages）: アクティブ {len(active_gm)} 件")
 
     prev_state = load_previous_state()
     changes = build_changes(prev_state, curr_state)
